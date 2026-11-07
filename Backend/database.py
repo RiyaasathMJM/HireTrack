@@ -1,38 +1,44 @@
 # ── database.py ───────────────────────────────────────────────────────────────
-# HireTrack — MySQL Database layer
+# HireTrack — PostgreSQL (Supabase) Database layer
 # Handles: connection pool, schema creation, per-request connection via Flask g
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os
-import mysql.connector
-from mysql.connector import pooling, Error as MySQLError
+import psycopg2
+import psycopg2.pool
+import psycopg2.extras
 from flask import g
 
 # ── Connection pool (created once when module is imported) ─────────────────────
-# Pool keeps N connections open and reuses them across requests.
-# Thread-safe — Flask dev server is multi-threaded.
-
-_pool: pooling.MySQLConnectionPool | None = None
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
-def _get_pool() -> pooling.MySQLConnectionPool:
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     """
     Lazily initialise the connection pool on first use.
     Reads credentials from environment variables (loaded from .env by app.py).
+    Supports both individual params and a full DATABASE_URL.
     """
     global _pool
     if _pool is None:
-        _pool = pooling.MySQLConnectionPool(
-            pool_name="hiretrack_pool",
-            pool_size=5,                        # max simultaneous connections
-            pool_reset_session=True,
-            host     = os.getenv("MYSQL_HOST",     "localhost"),
-            port     = int(os.getenv("MYSQL_PORT", "3306")),
-            user     = os.getenv("MYSQL_USER",     "root"),
-            password = os.getenv("MYSQL_PASSWORD", ""),
-            database = os.getenv("MYSQL_DATABASE", "hiretrack"),
-            autocommit = False,
-        )
+        database_url = os.getenv("DATABASE_URL", "")
+        if database_url:
+            _pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=5,
+                dsn=database_url,
+            )
+        else:
+            _pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=5,
+                host     = os.getenv("PG_HOST",     "localhost"),
+                port     = int(os.getenv("PG_PORT",  "5432")),
+                user     = os.getenv("PG_USER",     "postgres"),
+                password = os.getenv("PG_PASSWORD", ""),
+                dbname   = os.getenv("PG_DATABASE", "postgres"),
+                sslmode  = os.getenv("PG_SSLMODE",  "require"),
+            )
     return _pool
 
 
@@ -45,20 +51,20 @@ def get_db():
     and returned to the pool after the request ends.
     """
     conn = getattr(g, "_db_conn", None)
-    if conn is None or not conn.is_connected():
-        conn = _get_pool().get_connection()
+    if conn is None or conn.closed:
+        conn = _get_pool().getconn()
         g._db_conn = conn
     return conn
 
 
 def get_cursor(conn=None):
     """
-    Return a dictionary cursor (rows returned as dicts, not tuples).
+    Return a RealDictCursor (rows returned as dicts, not tuples).
     If no connection is provided, gets one from the pool via get_db().
     """
     if conn is None:
         conn = get_db()
-    return conn.cursor(dictionary=True)
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def close_db(exc=None):
@@ -74,105 +80,114 @@ def close_db(exc=None):
             else:
                 conn.rollback()     # rollback on error
         finally:
-            conn.close()            # returns connection to pool
+            _get_pool().putconn(conn)   # returns connection to pool
             g._db_conn = None
 
 
 # ── Schema ─────────────────────────────────────────────────────────────────────
-# Split into individual statements — MySQL does not support executescript().
 
 _CREATE_JOB_DESCRIPTIONS = """
 CREATE TABLE IF NOT EXISTS job_descriptions (
-    id          INT          NOT NULL AUTO_INCREMENT,
+    id          SERIAL       NOT NULL,
     title       VARCHAR(255) NOT NULL,
-    description LONGTEXT     NOT NULL,
-    created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
-                                      ON UPDATE CURRENT_TIMESTAMP,
+    description TEXT         NOT NULL,
+    created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
     PRIMARY KEY (id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+);
 """
 
 _CREATE_CANDIDATES = """
 CREATE TABLE IF NOT EXISTS candidates (
-    id          INT           NOT NULL AUTO_INCREMENT,
+    id          SERIAL        NOT NULL,
 
     -- Extracted from resume
     name        VARCHAR(255)  NOT NULL DEFAULT '',
     email       VARCHAR(255)           DEFAULT '',
     phone       VARCHAR(64)            DEFAULT '',
-    skills      JSON                   DEFAULT (JSON_ARRAY()),
+    skills      JSONB                  DEFAULT '[]'::jsonb,
 
     -- Recruiter-managed
-    stage       ENUM(
-                    'applied',
-                    'screening',
-                    'interview',
-                    'offer',
-                    'rejected'
-                )             NOT NULL DEFAULT 'applied',
-    star_rating TINYINT                DEFAULT 0,
+    stage       VARCHAR(32)   NOT NULL DEFAULT 'applied',
+    star_rating SMALLINT               DEFAULT 0,
     notes       TEXT                   DEFAULT NULL,
 
     -- Resume content
-    resume_text LONGTEXT               DEFAULT NULL,
+    resume_text TEXT                   DEFAULT NULL,
     file_name   VARCHAR(255)           DEFAULT '',
 
     -- Match score vs a Job Description (0.0 – 100.0)
-    match_score DOUBLE                 DEFAULT 0.0,
+    match_score DOUBLE PRECISION       DEFAULT 0.0,
     jd_id       INT                    DEFAULT NULL,
 
     -- Timestamps
-    created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
-                                       ON UPDATE CURRENT_TIMESTAMP,
+    created_at  TIMESTAMP     NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP     NOT NULL DEFAULT NOW(),
 
     PRIMARY KEY (id),
     CONSTRAINT fk_candidate_jd
         FOREIGN KEY (jd_id)
         REFERENCES job_descriptions(id)
         ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+);
+"""
+
+# Trigger to auto-update updated_at on candidates
+_CREATE_UPDATE_TRIGGER_FN = """
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+   NEW.updated_at = NOW();
+   RETURN NEW;
+END;
+$$ language 'plpgsql';
+"""
+
+_CREATE_CANDIDATES_TRIGGER = """
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'set_candidates_updated_at'
+  ) THEN
+    CREATE TRIGGER set_candidates_updated_at
+    BEFORE UPDATE ON candidates
+    FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
+  END IF;
+END;
+$$;
+"""
+
+_CREATE_JD_TRIGGER = """
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'set_jd_updated_at'
+  ) THEN
+    CREATE TRIGGER set_jd_updated_at
+    BEFORE UPDATE ON job_descriptions
+    FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
+  END IF;
+END;
+$$;
 """
 
 _SCHEMA_STATEMENTS = [
     _CREATE_JOB_DESCRIPTIONS,
     _CREATE_CANDIDATES,
+    _CREATE_UPDATE_TRIGGER_FN,
+    _CREATE_CANDIDATES_TRIGGER,
+    _CREATE_JD_TRIGGER,
 ]
 
 
 # ── Database initialisation ────────────────────────────────────────────────────
 
-def create_database_if_missing():
-    """
-    Connect WITHOUT specifying a database and create it if it doesn't exist.
-    This is separate from the pool because the pool requires the DB to exist.
-    """
-    db_name = os.getenv("MYSQL_DATABASE", "hiretrack")
-    conn = mysql.connector.connect(
-        host     = os.getenv("MYSQL_HOST",     "localhost"),
-        port     = int(os.getenv("MYSQL_PORT", "3306")),
-        user     = os.getenv("MYSQL_USER",     "root"),
-        password = os.getenv("MYSQL_PASSWORD", ""),
-    )
-    cursor = conn.cursor()
-    cursor.execute(
-        f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
-        f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-
 def init_db(app):
     """
-    1. Create the MySQL database if it doesn't exist.
-    2. Create all tables (safe — uses CREATE TABLE IF NOT EXISTS).
+    Create all tables (safe — uses CREATE TABLE IF NOT EXISTS).
     Called once on server startup from app.py.
+    For PostgreSQL/Supabase, the database already exists.
     """
-    create_database_if_missing()
-
     with app.app_context():
         conn = get_db()
         cursor = conn.cursor()

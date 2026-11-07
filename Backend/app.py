@@ -1,5 +1,5 @@
 # ── app.py ────────────────────────────────────────────────────────────────────
-# HireTrack — Flask application  (Phase 1 · Step 2 — All routes)
+# HireTrack — Flask application (PostgreSQL / Supabase edition)
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -49,17 +49,17 @@ def now_iso() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def row_to_dict(row: dict) -> dict:
+def row_to_dict(row) -> dict:
     """
-    Post-process a candidate row returned by MySQL dictionary cursor.
-    Converts datetime objects → strings, JSON skills string → list.
+    Post-process a candidate row returned by psycopg2 RealDictCursor.
+    Converts datetime objects → strings, JSONB skills (already list) → ensures list.
     """
     d = dict(row)
-    # MySQL returns datetime objects — convert to string
+    # psycopg2 returns datetime objects — convert to string
     for field in ("created_at", "updated_at"):
         if isinstance(d.get(field), datetime):
             d[field] = d[field].isoformat()
-    # skills stored as JSON string in DB
+    # psycopg2 JSONB returns Python list directly — no json.loads needed
     if isinstance(d.get("skills"), str):
         try:
             d["skills"] = json.loads(d["skills"])
@@ -67,10 +67,13 @@ def row_to_dict(row: dict) -> dict:
             d["skills"] = []
     elif d.get("skills") is None:
         d["skills"] = []
+    # ensure it's a list (not some other type)
+    if not isinstance(d.get("skills"), list):
+        d["skills"] = []
     return d
 
 
-def jd_row_to_dict(row: dict) -> dict:
+def jd_row_to_dict(row) -> dict:
     """Post-process a job_descriptions row."""
     d = dict(row)
     for field in ("created_at", "updated_at"):
@@ -120,9 +123,9 @@ def register_meta_routes(app: Flask) -> None:
 
         res = {
             "status":       "ok" if db_ok else "degraded",
-            "database":     "mysql",
-            "db_host":      os.getenv("MYSQL_HOST", "localhost"),
-            "db_name":      os.getenv("MYSQL_DATABASE", "hiretrack"),
+            "database":     "postgresql",
+            "db_host":      os.getenv("PG_HOST", os.getenv("DATABASE_URL", "supabase")),
+            "db_name":      os.getenv("PG_DATABASE", "postgres"),
             "ai_available": bool(HAS_OPENAI and os.getenv("OPENAI_API_KEY", "")),
             "pypdf":        HAS_PYPDF,
             "docx":         HAS_DOCX,
@@ -173,19 +176,21 @@ def register_candidate_routes(app: Flask) -> None:
             # Parse the file
             parsed = parse_resume(str(save_path), filename)
 
+            # Use RETURNING id to get the new row's ID (PostgreSQL style)
             cursor.execute(
                 """
                 INSERT INTO candidates
                     (name, email, phone, skills, stage, star_rating,
                      notes, resume_text, file_name, match_score,
                      created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
                 """,
                 (
                     parsed["name"],
                     parsed["email"],
                     parsed["phone"],
-                    json.dumps(parsed["skills"]),  # store as JSON string
+                    json.dumps(parsed["skills"]),  # cast to jsonb
                     "applied",
                     0,
                     "",
@@ -196,7 +201,7 @@ def register_candidate_routes(app: Flask) -> None:
                     now_iso(),
                 ),
             )
-            new_id = cursor.lastrowid
+            new_id = cursor.fetchone()["id"]
             conn.commit()
 
             cursor.execute("SELECT * FROM candidates WHERE id = %s", (new_id,))
@@ -239,7 +244,7 @@ def register_candidate_routes(app: Flask) -> None:
         if keyword:
             sql   += (" AND (LOWER(name) LIKE %s"
                       " OR LOWER(email) LIKE %s"
-                      " OR LOWER(skills) LIKE %s"
+                      " OR skills::text ILIKE %s"
                       " OR LOWER(resume_text) LIKE %s)")
             kw = f"%{keyword}%"
             params.extend([kw, kw, kw, kw])
@@ -306,13 +311,24 @@ def register_candidate_routes(app: Flask) -> None:
                 return jsonify({"error": "star_rating must be 0–5"}), 400
             updates["star_rating"] = rating
 
-        # Serialize skills list → JSON string
+        # Serialize skills list → JSON string for JSONB cast
         if "skills" in updates and isinstance(updates["skills"], list):
             updates["skills"] = json.dumps(updates["skills"])
 
         updates["updated_at"] = now_iso()
-        set_clause = ", ".join(f"{col} = %s" for col in updates)
-        values     = list(updates.values()) + [cid]
+
+        # Build SET clause — handle JSONB cast for skills
+        set_parts = []
+        values    = []
+        for col, val in updates.items():
+            if col == "skills":
+                set_parts.append(f"{col} = %s::jsonb")
+            else:
+                set_parts.append(f"{col} = %s")
+            values.append(val)
+
+        set_clause = ", ".join(set_parts)
+        values.append(cid)
 
         cursor.execute(
             f"UPDATE candidates SET {set_clause} WHERE id = %s", values
@@ -422,7 +438,6 @@ def register_jd_routes(app: Flask) -> None:
     def create_jd():
         """
         Body: { "title": "Senior Python Dev", "description": "We need..." }
-        Sarah types her JD here and saves it for repeated use.
         """
         data  = request.get_json(force=True) or {}
         title = data.get("title", "").strip()
@@ -439,10 +454,11 @@ def register_jd_routes(app: Flask) -> None:
             """
             INSERT INTO job_descriptions (title, description, created_at, updated_at)
             VALUES (%s, %s, %s, %s)
+            RETURNING id
             """,
             (title, desc, now_iso(), now_iso()),
         )
-        new_id = cursor.lastrowid
+        new_id = cursor.fetchone()["id"]
         conn.commit()
 
         cursor.execute(
@@ -485,7 +501,6 @@ def register_jd_routes(app: Flask) -> None:
     @app.route("/api/jobs/<int:jid>", methods=["PATCH"])
     def update_jd(jid: int):
         """
-        Sarah can update the title or description of any saved JD.
         Body: { "title": "...", "description": "..." }
         """
         conn   = get_db()
@@ -610,11 +625,12 @@ if __name__ == "__main__":
     port  = int(os.getenv("PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "true").lower() == "true"
 
-    print(f"\n[HireTrack] Backend (MySQL) starting on http://localhost:{port}")
-    print(f"   DB     : {os.getenv('MYSQL_USER','root')}@{os.getenv('MYSQL_HOST','localhost')}:{os.getenv('MYSQL_PORT','3306')}/{os.getenv('MYSQL_DATABASE','hiretrack')}")
+    pg_host = os.getenv("PG_HOST", os.getenv("DATABASE_URL", "supabase"))
+    print(f"\n[HireTrack] Backend (PostgreSQL/Supabase) starting on http://localhost:{port}")
+    print(f"   DB     : {os.getenv('PG_USER','postgres')}@{pg_host}/{os.getenv('PG_DATABASE','postgres')}")
     print(f"   pypdf  : {'OK' if HAS_PYPDF  else 'MISSING'}")
     print(f"   docx   : {'OK' if HAS_DOCX   else 'MISSING'}")
     print(f"   AI key : {'SET' if os.getenv('OPENAI_API_KEY') else 'NOT SET (heuristic fallback)'}")
     print()
 
-    app.run(debug=debug, port=port)
+    app.run(debug=debug, port=port, host="0.0.0.0")

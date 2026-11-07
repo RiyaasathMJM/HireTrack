@@ -1,0 +1,13 @@
+[build]
+  base    = "Frontend"
+  command = "npm run build"
+  publish = "dist"
+
+[dev]
+  base    = "Frontend"
+  command = "npm run dev"
+
+[[redirects]]
+  from   = "/*"
+  to     = "/index.html"
+  status = 200
