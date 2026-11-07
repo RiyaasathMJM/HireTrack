@@ -17,7 +17,6 @@ import {
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import TopBar from '../components/layout/TopBar';
-import StageTag from '../components/ui/StageTag';
 import StarRating from '../components/ui/StarRating';
 import MatchScoreBar from '../components/ui/MatchScoreBar';
 import SkillChip from '../components/ui/SkillChip';
